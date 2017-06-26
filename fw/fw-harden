@@ -1,54 +1,87 @@
-*filter
+#!/bin/bash
 
-# Allow all loopback (lo) traffic and reject traffic
-# to localhost that does not originate from lo.
--A INPUT -i lo -j ACCEPT
--A INPUT ! -i lo -s 127.0.0.0/8 -j REJECT
--A OUTPUT -o lo -j ACCEPT
+# OpenVPN ports used by major providers:
+OPENVPN_UDP_PORTS="53,1194,1197,1198"
 
+# OPENVPN Server Tunnel
+OPENVPN_SERVER_TUN="tun0"
+
+# OPENVPN Gateway Tunnel
+OPENVPN_GATEWAY_TUN="tun1"
+
+# delete all existing rules
+iptables -Z
+iptables --flush
+iptables --delete-chain
+iptables -t nat -F
+
+###LOOPBACK###
 # Allow ping and ICMP error returns.
--A INPUT -p icmp -m state --state NEW --icmp-type 8 -j ACCEPT
--A INPUT -p icmp -m state --state ESTABLISHED,RELATED -j ACCEPT
--A OUTPUT -p icmp -j ACCEPT
+iptables -A INPUT -p icmp -m state --state NEW --icmp-type 8 -j ACCEPT
+iptables -A INPUT -p icmp -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -p icmp -j ACCEPT
+###NETWORK INTERFACE###
+# Allow SSH (Server Control)
+iptables -A INPUT -i eth0 -p tcp -m state --state NEW,ESTABLISHED --dport 22 -j ACCEPT
+iptables -A OUTPUT -o eth0 -p tcp -m state --state ESTABLISHED --sport 22 -j ACCEPT
+# Allow UDP traffic on port 1194. (VPN Server)
+iptables -A INPUT -i eth0 -p udp -m state --state NEW,ESTABLISHED --dport 1194 -j ACCEPT
+iptables -A OUTPUT -o eth0 -p udp -m state --state ESTABLISHED --sport 1194 -j ACCEPT
+iptables -A OUTPUT -o eth0 -p udp -m multiport --dports $OPENVPN_UDP_PORTS -m comment --comment "openvpn" -j ACCEPT
 
-# Allow SSH.
--A INPUT -i eth0 -p tcp -m state --state NEW,ESTABLISHED --dport 22 -j ACCEPT
--A OUTPUT -o eth0 -p tcp -m state --state ESTABLISHED --sport 22 -j ACCEPT
-
-# Allow UDP traffic on port 1194.
--A INPUT -i eth0 -p udp -m state --state NEW,ESTABLISHED --dport 1194 -j ACCEPT
--A OUTPUT -o eth0 -p udp -m state --state ESTABLISHED --sport 1194 -j ACCEPT
-
-# Allow DNS resolution and limited HTTP/S on eth0.
+###OPENVPN GATEWAY TUNNEL###
+# Allow DNS resolution and limited HTTP/S on the VPN Gateway.
 # Necessary for updating the server and keeping time.
--A INPUT -i eth0 -p udp -m state --state ESTABLISHED --sport 53 -j ACCEPT
--A OUTPUT -o eth0 -p udp -m state --state NEW,ESTABLISHED --dport 53 -j ACCEPT
--A INPUT -i eth0 -p tcp -m state --state ESTABLISHED --sport 53 -j ACCEPT
--A OUTPUT -o eth0 -p tcp -m state --state NEW,ESTABLISHED --dport 53 -j ACCEPT
+iptables -A INPUT -i $OPENVPN_GATEWAY_TUN -p udp -m state --state ESTABLISHED --sport 53 -j ACCEPT
+iptables -A OUTPUT -o $OPENVPN_GATEWAY_TUN -p udp -m state --state NEW,ESTABLISHED --dport 53 -j ACCEPT
+iptables -A INPUT -i $OPENVPN_GATEWAY_TUN -p tcp -m state --state ESTABLISHED --sport 53 -j ACCEPT
+iptables -A OUTPUT -o $OPENVPN_GATEWAY_TUN -p tcp -m state --state NEW,ESTABLISHED --dport 53 -j ACCEPT
+iptables -A OUTPUT -o $OPENVPN_GATEWAY_TUN -p udp -m udp --dport 123 -m comment --comment "ntp" -j ACCEPT
+iptables -A INPUT -i $OPENVPN_GATEWAY_TUN -p tcp -m state --state ESTABLISHED --sport 80 -j ACCEPT
+iptables -A OUTPUT -o $OPENVPN_GATEWAY_TUN -p tcp -m state --state NEW,ESTABLISHED --dport 80 -j ACCEPT
+iptables -A INPUT -i $OPENVPN_GATEWAY_TUN -p tcp -m state --state ESTABLISHED --sport 443 -j ACCEPT
+iptables -A OUTPUT -o $OPENVPN_GATEWAY_TUN -p tcp -m state --state NEW,ESTABLISHED --dport 443 -j ACCEPT
+# accept inbound vpn initiated traffic
+iptables -A INPUT -i $OPENVPN_GATEWAY_TUN -m state --state ESTABLISHED,RELATED -j ACCEPT
 
--A INPUT -i eth0 -p tcp -m state --state ESTABLISHED --sport 80 -j ACCEPT
--A OUTPUT -o eth0 -p tcp -m state --state NEW,ESTABLISHED --dport 80 -j ACCEPT
--A INPUT -i eth0 -p tcp -m state --state ESTABLISHED --sport 443 -j ACCEPT
--A OUTPUT -o eth0 -p tcp -m state --state NEW,ESTABLISHED --dport 443 -j ACCEPT
-
+###OPENVPN SERVER TUNNEL###
 # Allow traffic on the TUN interface.
--A INPUT -i tun0 -j ACCEPT
--A FORWARD -i tun0 -j ACCEPT
--A OUTPUT -o tun0 -j ACCEPT
+iptables -A INPUT -i $OPENVPN_SERVER_TUN -j ACCEPT
+iptables -A FORWARD -i $OPENVPN_SERVER_TUN -j ACCEPT
+iptables -A OUTPUT -o $OPENVPN_SERVER_TUN -j ACCEPT
+# DHCP
+iptables -A OUTPUT -o $OPENVPN_SERVER_TUN -p udp -m udp --dport 67:68 -m comment --comment "dhcp" -j ACCEPT
+
+###LINK SERVER TO TUNNEL###
+iptables -A FORWARD -i $OPENVPN_GATEWAY_TUN -o $OPENVPN_SERVER_TUN -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -i $OPENVPN_SERVER_TUN -o $OPENVPN_GATEWAY_TUN -m comment --comment "LAN out to VPN" -j ACCEPT
 
 # Allow forwarding traffic only from the VPN.
--A FORWARD -i tun0 -o eth0 -s 10.8.0.0/24 -j ACCEPT
--A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -i $OPENVPN_SERVER_TUN -o eth0 -s 10.8.0.0/24 -j ACCEPT
+iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# Masquerade - OPENVPN Server
+iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o IPv4dev -j MASQUERADE
+# Masquerade - OPENVPN Client
+iptables -t nat -A POSTROUTING -o $OPENVPN_GATEWAY_TUN -j MASQUERADE
+
+# add killswitch chain:
+iptables -N killswitch
+
+# add killswitch chain to OUTPUT chain:
+iptables -t filter -A OUTPUT -j killswitch
+iptables -t filter -A killswitch  -j RETURN
 
 # Log any packets which don't fit the rules above...
 # (optional but useful)
--A INPUT -m limit --limit 3/min -j LOG --log-prefix "iptables_INPUT_denied: " --log-level 4
--A FORWARD -m limit --limit 3/min -j LOG --log-prefix "iptables_FORWARD_denied: " --log-level 4
--A OUTPUT -m limit --limit 3/min -j LOG --log-prefix "iptables_OUTPUT_denied: " --log-level 4
+iptables -A INPUT -m limit --limit 3/min -j LOG --log-prefix "iptables_INPUT_denied: " --log-level 4
+iptables -A FORWARD -m limit --limit 3/min -j LOG --log-prefix "iptables_FORWARD_denied: " --log-level 4
+iptables -A OUTPUT -m limit --limit 3/min -j LOG --log-prefix "iptables_OUTPUT_denied: " --log-level 4
 
 # then reject them.
--A INPUT -j REJECT
--A FORWARD -j REJECT
--A OUTPUT -j REJECT
+iptables -A INPUT -j REJECT
+iptables -A FORWARD -j REJECT
+iptables -A OUTPUT -j REJECT
 
-COMMIT
+# save the firewall rules
+iptables-save > /etc/iptables/rules.v4
